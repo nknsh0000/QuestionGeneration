@@ -4,6 +4,9 @@ import os
 import sys
 import numpy as np
 import tensorflow as tf
+from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import nn_ops
 
 class Seq2Seq(object):
     def __init__(self, vocab_size, batch_size, embedding_dim, hidden_size,\
@@ -16,21 +19,6 @@ class Seq2Seq(object):
         self.dec_seq_length = dec_seq_length
         self.start_token = start_token
         self.learning_rate = learning_rate
-
-
-    def return_seq2seq(self, encoder_inputs, decoder_inputs, TEST):
-        cell = tf.nn.rnn_cell.BasicLSTMCell(self.hidden_size)
-        #outputs, states = tf.nn.seq2seq.embedding_attention_seq2seq(
-        outputs, states = tf.contrib.legacy_seq2seq.embedding_attention_seq2seq(
-                            encoder_inputs,
-                            decoder_inputs,
-                            cell,
-                            num_encoder_symbols = self.vocab_size,
-                            num_decoder_symbols = self.vocab_size,
-                            embedding_size = self.embedding_dim,
-                            feed_previous = TEST
-                            )
-        return outputs, states
 
     def construct_graph(self, Test=False):
         encoder_inputs = list()
@@ -46,91 +34,93 @@ class Seq2Seq(object):
             labels.append(tf.placeholder(tf.int32, shape=(None,)))
             weights.append(tf.placeholder(tf.float32, shape=(None, )))
 
-        outputs, states = self.return_seq2seq(encoder_inputs, decoder_inputs, TEST=Test)
+        #outputs, states = self.return_seq2seq(encoder_inputs, decoder_inputs, TEST=Test)
 
-        return encoder_inputs, decoder_inputs, labels, weights, outputs
+        #return encoder_inputs, decoder_inputs, labels, weights, outputs
+        return encoder_inputs, decoder_inputs, labels, weights,
 
-    def loss(self, output, label, weight):
+    def output(self, encoder_inputs, decoder_inputs, Test=False):
+        #outputs, states = self.return_seq2seq(encoder_inputs, decoder_inputs, TEST=Test)
+        cell = tf.nn.rnn_cell.BasicLSTMCell(self.hidden_size)
+        #outputs, states = tf.nn.seq2seq.embedding_attention_seq2seq(
+        outputs, states = tf.contrib.legacy_seq2seq.embedding_attention_seq2seq(
+                            encoder_inputs,
+                            decoder_inputs,
+                            cell,
+                            num_encoder_symbols = self.vocab_size,
+                            num_decoder_symbols = self.vocab_size,
+                            embedding_size = self.embedding_dim,
+                            feed_previous = Test
+                            )
+        return outputs, states
+
+
+    def _pre_loss(self, output, label, weight):
         #print(output)
         #return tf.contrib.seq2seq.sequence_loss(output, label, weight)
         return tf.contrib.legacy_seq2seq.sequence_loss(output, label, weight)
 
-    def optimizer(self, loss):
+    def _sample_loss(self, logits, targets, weights):
+        log_perp_list = []
+
+        for logit, target, weight in zip(logits, targets, weights):
+            target = array_ops.reshape(target, [-1])
+            crossent = nn_ops.sparse_softmax_cross_entropy_with_logits(
+                labels=target, logits=logit)
+
+            log_perp_list.append(crossent * weight)
+
+        log_perps = math_ops.add_n(log_perp_list)
+        loss = math_ops.reduce_sum(log_perps)
+        return loss
+
+    def _ad_loss(self, rewards, logits, targets, weights):
+        # get from rollout policy and discriminator
+        log_perp_list = []
+        rewards = tf.transpose(rewards) # 20, 64
+
+        for i, (logit, target, weight) in enumerate(zip(logits, targets, weights)):
+            reward = rewards[i]
+            target = array_ops.reshape(target, [-1])
+            reward = array_ops.reshape(reward, [-1])
+
+            # これがlabelsに対するloss??
+            crossent = nn_ops.sparse_softmax_cross_entropy_with_logits(
+                labels=target, logits=logit)
+
+            # これがdiscriminatorに対するloss??
+            reward = tf.cast(reward, tf.float32)
+            log_perp_list.append(crossent * weight * reward)
+
+        log_perps = math_ops.add_n(log_perp_list)
+        loss = math_ops.reduce_sum(log_perps)
+
+        return loss
+
+    def _optimizer(self, loss):
         return tf.train.GradientDescentOptimizer(self.learning_rate).minimize(loss)
 
-    def train_step(self, encoder_inputs, decoder_inputs, labels, weights, outputs):
-        """
-        lossとupdate_opを返す.
-        """
-
-        #encoder_inputs, decoder_inputs, labels, weights, outputs = self._construct_graph()
-        # softmax
-        predictions = tf.stack([tf.nn.softmax(output) for output in outputs])
-
-        #losses = []
-        #for output, label, weight in zip(outputs, labels, weights):
-        loss = self.loss(outputs, labels, weights)
-            #losses.append(l)
-        #loss = np.mean(losses)
-
-        opt = self.optimizer(loss)
-        saver = tf.train.Saver()
-
-        return loss, opt, predictions, saver
-
-    def test_step(self, encoder_inputs, decoder_inputs, labels, weights, outputs):
-        """
-        lossを返す.
-        """
-
-        #encoder_inputs, decoder_inputs, labels, weights, outputs = self._construct_graph()
-        predictions = tf.stack([tf.nn.softmax(output) for output in outputs])
-
-        #losses = []
-        #for output, label, weight in zip(outputs, labels, weights):
-        loss = self.loss(outputs, labels, weights)
-
-        return loss,predictions
-
-    def generate(self, encoder_inputs, decoder_inputs, labels, weights, outputs):
+    def generate(self,outputs):
         predictions = tf.stack([tf.nn.softmax(output) for output in outputs])
         return predictions
 
-    def pre_train_epoch(self, sess, model, in_seq_length, out_seq_length, data_loader):
-        ### 1epoch分 pre-train
-        #graph = tf.Graph()
-        #with graph.as_default():
-            #model = Seq2Seq(self.vocab_size, self.batch_size, embedding_dim=128, hidden_size=100,
-            #            enc_seq_length=in_seq_length, dec_seq_length=out_seq_length, start_token=start_token,
-            #            learning_rate=learning_rate)
-        encoder_inputs, decoder_inputs, labels, weights, outputs = model.construct_graph()
+    def pre_train(self, labels, weights, outputs):
+        loss = self._pre_loss(outputs, labels, weights)
+        opt = self._optimizer(loss)
+        return loss, opt
 
-        loss_op, opt_op, predictions_op, saver_op = model.train_step(encoder_inputs, decoder_inputs, labels, weights, outputs)
-        #test_loss_op, test_predictions_op = model.test_step(encoder_inputs, decoder_inputs, labels, weights, outputs)
-
-        losses = []
-        for it in range(data_loader.num_batch):
-            #print('epoch ', epoch, ' batch ', it)
-            X_batch, y_batch, w_batch = data_loader.next_batch()
-
-            # feed_dict 構築
-            feed_dict = {}
-            feed_dict = {encoder_inputs[i]: X_batch[i] for i in range(in_seq_length)}
-            feed_dict.update({decoder_inputs[i]:y_batch[i] for i in range(out_seq_length)})
-            feed_dict.update({labels[i]:y_batch[i] for i in range(out_seq_length)}) # 正解データ
-            feed_dict.update({weights[i]:w_batch[i] for i in range(out_seq_length)})
-
-            #l, w, o = sess.run([labels, weights, outputs], feed_dict=feed_dict)
-
-            l, _, predictions = sess.run([loss_op, opt_op, predictions_op], feed_dict=feed_dict)
-
-            #loss = sess.run([loss_op], feed_dict=feed_dict)
-            losses.append(l)
-        loss = np.mean(losses)
-        #outputs = sess.run([self.pretrain_updates, self.pretrain_loss], feed_dict={self.x: x})
-
-        return loss, predictions
+    def return_saver(self):
+        return tf.train.Saver()
 
 
+    def return_rewards(self):
+        #return tf.placeholder(tf.float32, shape=[self.batch_size, self.dec_seq_length])
+        return tf.placeholder(tf.float32, shape=[self.batch_size, self.dec_seq_length])
+
+
+    def ad_train(self, rewards, labels, weights, outputs):
+        loss = self._ad_loss(rewards, outputs, labels, weights)
+        opt = self._optimizer(loss)
+        return loss, opt
 
 #end

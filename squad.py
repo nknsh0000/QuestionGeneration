@@ -145,7 +145,7 @@ class Squad(object):
 				word = self.in_idx2word[int(index)]
 			except KeyError:
 				word = error_word
-		if type(word) == type(u'\xe9'):
+		if type(word) != type(str('ab')):
 			word = word.encode('utf-8')
 		return word
 
